@@ -11,5 +11,6 @@ Extracting data from Staging layer applied tranformation and store it again to r
 
 6--> Not a fuuly optimized code and there are places to optimize it. 
 
-
+### ERD Diagram links--  https://dbdiagram.io/d/Formiable-STG-ERD-67e7f3844f7afba184a958c1
+                         https://dbdiagram.io/d/Formiable-RPT-ERD-67e7f3cd4f7afba184a95d00
 
