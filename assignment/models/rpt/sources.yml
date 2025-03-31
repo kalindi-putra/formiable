@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: reporting
+    description: This source contains reporting data .
+    database: postgress
+    schema: prod
+
+    tables:
+      - name: rpt_aus_bussiness.sql

@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: staging
+    description: This source contains staging data .
+    database: postgress
+    schema: prod
+
+    tables:
+      - name: commoncrawl
+      - name: abn_details

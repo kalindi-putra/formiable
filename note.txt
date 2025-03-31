@@ -1,0 +1,15 @@
+*****************************Note on my approach**************************
+
+1--> Used the CC_INDEX-2025-08 data for aus domains
+2--> Used python script for extracting and storing in postgress
+3--> Used DBT , -- created the staging layer and reporting layer. 
+Extracting data from Staging layer applied tranformation and store it again to rpt layer.
+
+4--> There is issue in extracting data using ABN api as it requires registring gov for issuing the dev api.
+
+5--> We could have deployed the code at Databricks enginer , leverging its parallel execution and performance.(i did not had trail and paid edition)
+
+6--> Not a fuuly optimized code and there are places to optimize it. 
+
+
+
