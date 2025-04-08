@@ -3,4 +3,5 @@
 logs/
 get-data.sh
 crawl-data/
-
+abr_data/
+*csv

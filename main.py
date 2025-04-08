@@ -1,283 +1,268 @@
 import requests
+import gzip
 import json
-import time
-import psycopg2
-import datetime
-from io import BytesIO
+import io
+import pandas as pd
 import re
-from bs4 import BeautifulSoup
-import os
-from urllib.parse import quote_plus, urlparse
-from warcio.archiveiterator import ArchiveIterator
+import time
+import random
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+from urllib.parse import urlparse
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-SERVER = 'http://index.commoncrawl.org/'
-INDEX_NAME = 'CC-MAIN-2025-05'
-
-DB_HOST = os.environ.get('DB_HOST')
-DB_PORT = int(os.environ.get('DB_PORT'))
-DB_NAME = os.environ.get('DB_NAME')
-DB_USER = os.environ.get('DB_USER')
-DB_PASSWORD = os.environ.get('DB_PASSWORD')
-
-target_urls = [
-    "com.au", "net.au", "org.au", "gov.au", "edu.au", "asn.au", "biz.au", "id.au", "csiro.au",
-]
-
-myagent = 'cc-get-started/1.0 (Example data retrieval script; cactusuncle8@gmail.com)'
-
-def get_db_connection():
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD
-        )
-        return conn
-    except Exception as e:
-        print(f"Error connecting to database: {e}")
-        return None
-
-def search_cc_index(url):
-    encoded_url = quote_plus(url)
-    index_url = f'{SERVER}{INDEX_NAME}-index?url={encoded_url}&output=json'
-    print(index_url)
-    response = requests.get(index_url, headers={'user-agent': myagent}, verify=False)
-    print("Response from server:\r\n", response.text)
-    if response.status_code == 200:
-        records = response.text.strip().split('\n')
-        return [json.loads(record) for record in records]
-    else:
-        return None
-
-def extract_abn(content):
-    abn_pattern = r'\b\d{2}\s?\d{3}\s?\d{3}\s?\d{3}\b'
+class CommonCrawlExtractor:
     
-    try:
-        text = content.decode('utf-8')
-    except UnicodeDecodeError:
+    def __init__(self, index='CC-MAIN-2025-13'):
+        self.index = index
+        self.index_url = f"https://index.commoncrawl.org/{index}-index"
+        # Improved regex pattern for Australian domains
+        self.au_domain_pattern = re.compile(r'^https?://([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+com\.au|net\.au|org\.au|edu\.au|gov\.au|asn\.au|id\.au|info\.au|conf\.au|oz\.au|act\.au|nsw\.au|nt\.au|qld\.au|sa\.au|tas\.au|vic\.au|wa\.au(/.*)?$')
+        # Keywords associated with business websites
+        self.business_keywords = ['about', 'contact', 'services', 'products', 'team', 'company', 'business']
+        # Setup session with retries
+        self.session = self._setup_session()
+        
+    def _setup_session(self):
+        """Set up a session with retry capability"""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=5,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+        
+    def get_index_urls(self, limit=None):
+        """Get list of index file URLs from CommonCrawl"""
         try:
-            text = content.decode('latin-1')
-        except:
-            return None
-    
-    abn_matches = re.findall(abn_pattern, text)
-    if abn_matches:
-        abn = re.sub(r'\s', '', abn_matches[0])
-        return abn
-    return None
-
-def extract_business_details(content, url):
-    try:
-        soup = BeautifulSoup(content, 'html.parser')
-        company_name = soup.title.string if soup.title else None
-        
-        return {
-            'company_name': company_name,
-            'company_url': url
-        }
-    except:
-        return {
-            'company_name': None,
-            'company_url': url
-        }
-
-def fetch_page_from_cc(records, url):
-    for record in records:
-        time.sleep(10)
-        offset, length = int(record['offset']), int(record['length'])
-        s3_url = f'https://data.commoncrawl.org/{record["filename"]}'
-        byte_range = f'bytes={offset}-{offset+length-1}'
-
-        response = requests.get(
-            s3_url,
-            headers={'user-agent': myagent, 'Range': byte_range},
-            stream=True,
-            verify=False
-        )
-
-        if response.status_code == 206:
-            stream = ArchiveIterator(response.raw)
-            for warc_record in stream:
-                if warc_record.rec_type == 'response':
-                    print(f"Found data for {url}")
-                    content = warc_record.content_stream().read()
-                    
-                    warc_headers = warc_record.rec_headers
-                    http_headers = warc_record.http_headers
-                    
-                    meta = {
-                        'url_key': record.get('urlkey', ''),
-                        'company_url': url,
-                        'file_name': record.get('filename', ''),
-                        'mime': http_headers.get_header('content-type', '') if http_headers else '',
-                        'encoding': http_headers.get_header('content-encoding', '') if http_headers else '',
-                        'length': record.get('length', 0),
-                        'offset': record.get('offset', 0),
-                        'digest': record.get('digest', ''),
-                        'mime_detected': record.get('mime-detected', ''),
-                        'languages': record.get('languages', ''),
-                        'timestamp': record.get('timestamp', '')
-                    }
-                    
-                    business_details = extract_business_details(content, url)
-                    if business_details['company_name']:
-                        meta['company_name'] = business_details['company_name']
-                    
-                    abn = extract_abn(content)
-                    
-                    save_to_database(meta, abn, content)
-                    
-                    return content
-        else:
-            print(f"Failed to fetch data: {response.status_code}")
-    
-    print(f"No valid WARC record found for {url}")
-    return None
-
-def save_to_database(metadata, abn, content):
-    conn = get_db_connection()
-    if not conn:
-        return
-    
-    try:
-        cursor = conn.cursor()
-        
-        data_load_date = datetime.datetime.now()
-        
-        cursor.execute("""
-            INSERT INTO stg_business_details 
-            (url_key, company_url, company_name, file_name, mime, encoding, 
-             length, offset, digest, mime_detected, languages, timestamp, data_load_date)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (url_key) DO UPDATE SET
-            company_url = EXCLUDED.company_url,
-            company_name = EXCLUDED.company_name,
-            data_load_date = EXCLUDED.data_load_date
-        """, (
-            metadata.get('url_key', ''),
-            metadata.get('company_url', ''),
-            metadata.get('company_name', ''),
-            metadata.get('file_name', ''),
-            metadata.get('mime', ''),
-            metadata.get('encoding', ''),
-            metadata.get('length', 0),
-            metadata.get('offset', 0),
-            metadata.get('digest', ''),
-            metadata.get('mime_detected', ''),
-            metadata.get('languages', ''),
-            metadata.get('timestamp', ''),
-            data_load_date
-        ))
-        
-        if abn:
-            entity_name = metadata.get('company_name', '')
+            response = self.session.get(f"{self.index_url}?output=json")
+            response.raise_for_status()
+            index_files = response.json()
             
-            cursor.execute("""
-                INSERT INTO stg_abn_details 
-                (ABN, entity_name, entity_type, registration_date, state, post_code, status, ACN, GST, data_load_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (ABN) DO UPDATE SET
-                entity_name = EXCLUDED.entity_name,
-                data_load_date = EXCLUDED.data_load_date
-            """, (
-                int(abn),
-                entity_name,
-                'Unknown',
-                None,
-                None,
-                None,
-                'Active',
-                None,
-                None,
-                data_load_date
-            ))
-        
-        conn.commit()
-        print(f"Successfully saved data for {metadata.get('company_url', '')}")
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"Error saving to database: {e}")
-    finally:
-        cursor.close()
-        conn.close()
-
-def create_tables_if_not_exist():
-    conn = get_db_connection()
-    if not conn:
-        return
-    
-    try:
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS stg_business_details (
-                url_key VARCHAR(255) PRIMARY KEY,
-                company_url VARCHAR(255),
-                company_name VARCHAR(255),
-                file_name VARCHAR(255),
-                mime VARCHAR(100),
-                encoding VARCHAR(50),
-                length INTEGER,
-                offset INTEGER,
-                digest VARCHAR(100),
-                mime_detected VARCHAR(100),
-                languages VARCHAR(50),
-                timestamp TIMESTAMP,
-                data_load_date TIMESTAMP
-            );
-        """)
-        
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS stg_abn_details (
-                ABN INTEGER PRIMARY KEY,
-                entity_name VARCHAR(255),
-                entity_type VARCHAR(100),
-                registration_date DATE,
-                state VARCHAR(50),
-                post_code VARCHAR(10),
-                status VARCHAR(50),
-                ACN VARCHAR(50),
-                GST VARCHAR(50),
-                data_load_date TIMESTAMP
-            );
-        """)
-        
-        conn.commit()
-        print("Database tables created or already exist")
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"Error creating tables: {e}")
-    finally:
-        cursor.close()
-        conn.close()
-
-def main():
-    create_tables_if_not_exist()
-    
-    for target_url in target_urls:
-        print(f"Processing {target_url}...")
-        records = search_cc_index(target_url)
-        
-        if records:
-            print(f"Found {len(records)} records for {target_url}")
-            content = fetch_page_from_cc(records, target_url)
+            if limit:
+                return [item['url'] for item in index_files[:limit]]
+            return [item['url'] for item in index_files]
+        except Exception as e:
+            print(f"Error fetching index URLs: {str(e)}")
+            return []
             
-            if content:
-                try:
-                    os.makedirs("outputs", exist_ok=True)
+    def extract_au_websites(self, index_url):
+        """Extract Australian websites from a single index file"""
+        au_results = []
+        
+        try:
+            # Add delay to avoid rate limiting
+            time.sleep(random.uniform(0.5, 2.0))
+            
+            response = self.session.get(index_url, stream=True)
+            response.raise_for_status()
+            
+            with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as f:
+                for line in f:
+                    try:
+                        record = json.loads(line)
+                        url = record.get('url', '')
+                        
+                        # Skip if not an Australian domain
+                        if not self.au_domain_pattern.match(url):
+                            continue
+                            
+                        # Extract domain and parse URL
+                        parsed_url = urlparse(url)
+                        domain = parsed_url.netloc
+                        path = parsed_url.path
+                        
+                        # Extract MIME type and status
+                        mime_type = record.get('mime', '')
+                        status = record.get('status', '')
+                        
+                        # Skip non-HTML content or error pages
+                        if 'text/html' not in mime_type or status != '200':
+                            continue
+                            
+                        # Check if this is likely a business page by examining the path
+                        has_business_indicator = any(keyword in path.lower() for keyword in self.business_keywords)
+                        
+                        # Initialize metadata
+                        metadata = {
+                            'company_name': '',
+                            'industry': '',
+                            'description': ''
+                        }
+                        
+                        # Extract metadata if available
+                        if 'metadata' in record:
+                            meta = record['metadata']
+                            for key in metadata:
+                                if key in meta:
+                                    metadata[key] = meta[key]
+                                    
+                        # Try to extract company name from domain if not in metadata
+                        if not metadata['company_name']:
+                            # Extract the second-level domain as company name (example.com.au -> example)
+                            domain_parts = domain.split('.')
+                            if len(domain_parts) >= 3:
+                                metadata['company_name'] = domain_parts[-3].capitalize()
+                            else:
+                                metadata['company_name'] = domain_parts[0].capitalize()
+                        
+                        # Extract industry from URL patterns if not in metadata
+                        if not metadata['industry']:
+                            domain_tld = '.'.join(domain.split('.')[-2:])  # Get TLD (com.au, org.au)
+                            if 'edu.au' in domain_tld:
+                                metadata['industry'] = 'Education'
+                            elif 'gov.au' in domain_tld:
+                                metadata['industry'] = 'Government'
+                            elif 'org.au' in domain_tld:
+                                metadata['industry'] = 'Non-profit'
+                            elif 'com.au' in domain_tld:
+                                metadata['industry'] = 'Commercial'
+                            else:
+                                metadata['industry'] = 'Other'
+                                
+                        # Create result dictionary
+                        result = {
+                            'url': url,
+                            'domain': domain,
+                            'company_name': metadata['company_name'],
+                            'industry': metadata['industry'],
+                            'description': metadata.get('description', ''),
+                            'path': path,
+                            'is_business_page': has_business_indicator,
+                            'crawl_time': record.get('timestamp', '')
+                        }
+                        
+                        au_results.append(result)
+                    except json.JSONDecodeError as E:
+                        print(E)
+                        continue
+                    except Exception as e:
+                        # Skip individual record errors
+                        continue
+                        
+        except Exception as e:
+            print(f"Error processing {index_url}: {str(e)}")
+            
+        return au_results
+        
+    def extract_websites(self, min_count=200000, max_workers=10, limit_index_files=None):
+        """Extract Australian websites using multiple threads"""
+        index_urls = self.get_index_urls(limit=limit_index_files)
+        results = []
+        
+        if not index_urls:
+            print("No index URLs found!")
+            return pd.DataFrame()
+            
+        print(f"Processing {len(index_urls)} index files...")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for url in index_urls:
+                futures.append(executor.submit(self.extract_au_websites, url))
+                
+            for future in tqdm(futures, desc="Processing index files"):
+                batch_results = future.result()
+                results.extend(batch_results)
+                
+                # Provide progress updates
+                if len(results) % 10000 == 0:
+                    print(f"Extracted {len(results)} websites so far...")
+                
+                if len(results) >= min_count:
+                    print(f"Reached minimum website count: {len(results)}")
+                    break
                     
-                    file_path = f"outputs/{target_url.replace('.', '_')}.html"
-                    with open(file_path, "wb") as file:
-                        file.write(content)
-                        print(f"Saved content to {file_path}")
-                except Exception as e:
-                    print(f"Error saving file: {e}")
-        else:
-            print(f"No records found for {target_url}")
+        if len(results) < min_count:
+            print(f"Warning: Only extracted {len(results)} websites, below minimum of {min_count}")
+            
+        # Convert to DataFrame and remove duplicates
+        df = pd.DataFrame(results)
+        if not df.empty:
+            # Remove duplicates by domain, keeping the most likely business page
+            df = df.sort_values('is_business_page', ascending=False)
+            df = df.drop_duplicates(subset=['domain'], keep='first')
+            
+            # Add some basic statistics
+            print(f"Industry distribution:\n{df['industry'].value_counts()}")
+            
+        return df
+        
+    def save_to_csv(self, df, output_path='australian_websites.csv'):
+        """Save extracted websites to CSV"""
+        if df.empty:
+            print("No data to save!")
+            return
+            
+        df.to_csv(output_path, index=False)
+        print(f"Saved {len(df)} Australian websites to {output_path}")
+        
+    def enrich_with_whois(self, df, sample_size=1000):
+        """Enrich data with WHOIS information for a sample of domains"""
+        try:
+            import whois
+        except ImportError:
+            print("whois package not installed. Run 'pip install python-whois' to use this feature.")
+            return df
+            
+        if df.empty:
+            return df
+            
+        # Take a sample if the dataframe is large
+        sample_df = df.sample(min(sample_size, len(df))) if len(df) > sample_size else df
+        
+        print(f"Enriching {len(sample_df)} domains with WHOIS data...")
+        
+        whois_data = []
+        for _, row in tqdm(sample_df.iterrows(), total=len(sample_df)):
+            domain = row['domain']
+            try:
+                # Add delay to avoid rate limiting
+                time.sleep(random.uniform(1.0, 3.0))
+                
+                w = whois.whois(domain)
+                whois_data.append({
+                    'domain': domain,
+                    'registrar': w.registrar,
+                    'creation_date': w.creation_date,
+                    'expiration_date': w.expiration_date,
+                    'last_updated': w.updated_date
+                })
+            except Exception as e:
+                continue
+                
+        whois_df = pd.DataFrame(whois_data)
+        
+        # Merge whois data with original dataframe
+        if not whois_df.empty:
+            merged_df = pd.merge(df, whois_df, on='domain', how='left')
+            return merged_df
+        
+        return df
 
 if __name__ == "__main__":
-    main()
+    # Create extractor instance
+    extractor = CommonCrawlExtractor(index='CC-MAIN-2025-03')
+    
+    # Extract websites with reasonable defaults
+    websites_df = extractor.extract_websites(
+        min_count=200,  # Target number of websites
+        max_workers=4,    # Number of parallel threads
+        limit_index_files=10  # Limit number of index files to process (for testing)
+    )
+    
+    
+    # Save results
+    extractor.save_to_csv(websites_df, 'australian_websites_2025.csv')
+    
+    # Show summary statistics
+    if not websites_df.empty:
+        print("\nWebsite statistics:")
+        print(f"Total websites: {len(websites_df)}")
+        print(f"Top industries:\n{websites_df['industry'].value_counts().head(10)}")
+        print(f"Top level domains:\n{websites_df['domain'].apply(lambda x: '.'.join(x.split('.')[-2:])).value_counts().head(5)}")
