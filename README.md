@@ -5,7 +5,7 @@ For DB we have used Postgress Cloud version and DBT for transformation on data.
 
 create virtual env using:- python -m venv .venv
 
-then activate it and ,
+then activate it and run below command to install requirements,
 
 pip install -r requirements.txt
 
